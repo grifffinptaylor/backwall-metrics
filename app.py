@@ -2,9 +2,17 @@ import streamlit as st
 from pathlib import Path
 import tempfile
 import cv2
+import pandas as pd
 
 from src.video import extract_frames, get_video_metadata
-from src.tracker import detect_people, load_model, draw_detections_on_frame, detect_people_in_frames
+from src.tracker import (
+    detect_people, 
+    load_model, 
+    draw_detections_on_frame, 
+    detect_people_in_frames,
+    track_target_player,
+    draw_tracking_path
+)
 
 st.set_page_config(page_title="BackWall Metrics", layout="wide")
 
@@ -22,6 +30,12 @@ if "model" not in st.session_state:
     st.session_state.model = None
 if "detections" not in st.session_state:
     st.session_state.detections = None
+if "target_point" not in st.session_state:
+    st.session_state.target_point = None
+if "target_person_idx" not in st.session_state:
+    st.session_state.target_person_idx = None
+if "tracking_df" not in st.session_state:
+    st.session_state.tracking_df = None
 
 # Create tabs
 tab1, tab2, tab3, tab4 = st.tabs(
@@ -205,37 +219,165 @@ with tab2:
                 st.metric("Avg People per Frame", f"{avg_per_frame:.1f}")
             
             st.divider()
+            st.subheader("🎯 Select Target Player")
+            st.write("Click on a person in the frame below to select them as your target player for tracking.")
             
-            # Show annotated sample frames
-            st.subheader("📽️ Sample Annotated Frames")
-            st.write("Frames with detected bounding boxes:")
-            
-            # Get frames with detections
-            detected_frame_paths = list(st.session_state.detections.keys())[:5]
-            
+            # Get first frame with detections for target selection
+            detected_frame_paths = list(st.session_state.detections.keys())
             if detected_frame_paths:
-                cols = st.columns(min(3, len(detected_frame_paths)))
+                first_frame_path = detected_frame_paths[0]
+                detections_in_first = st.session_state.detections[first_frame_path]
                 
-                for idx, frame_path in enumerate(detected_frame_paths):
-                    detections = st.session_state.detections[frame_path]
+                if len(detections_in_first) > 0:
+                    col1, col2 = st.columns([3, 1])
                     
-                    if len(detections) > 0:
-                        with cols[idx % len(cols)]:
-                            with st.spinner(f"Annotating frame {idx+1}..."):
-                                annotated = draw_detections_on_frame(
-                                    frame_path,
-                                    detections,
-                                    color=(0, 255, 0)
-                                )
-                                
-                                # Convert BGR to RGB for display
-                                annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-                                st.image(annotated_rgb, use_container_width=True)
-                                st.caption(f"{len(detections)} people detected")
-            else:
-                st.warning("⚠️ No people detected in any frames")
+                    with col1:
+                        st.write("**Click buttons below to select a person:**")
+                        
+                        # Show frame with all detections
+                        annotated = draw_detections_on_frame(
+                            first_frame_path,
+                            detections_in_first,
+                            color=(0, 255, 0)
+                        )
+                        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                        st.image(annotated_rgb, use_container_width=True)
+                    
+                    with col2:
+                        st.write("")
+                        st.write("")
+                        # Person selection buttons
+                        for idx, det in enumerate(detections_in_first[:10]):  # Limit to 10 people
+                            btn_label = f"Person {idx+1}\n({det['conf']:.2f})"
+                            if st.button(btn_label, key=f"select_person_{idx}"):
+                                st.session_state.target_person_idx = idx
+                                st.session_state.target_point = (det["center_x"], det["center_y"])
+                                st.success(f"✓ Selected Person {idx+1} as target")
+                                st.rerun()
+                    
+                    # Show target selection status
+                    if st.session_state.target_point:
+                        st.info(f"✓ **Target Selected:** Person {st.session_state.target_person_idx + 1} at position {st.session_state.target_point}")
+                        
+                        # Show target selection on frame
+                        annotated_with_target = draw_detections_on_frame(
+                            first_frame_path,
+                            detections_in_first,
+                            color=(0, 255, 0),
+                            highlighted_idx=st.session_state.target_person_idx
+                        )
+                        annotated_rgb = cv2.cvtColor(annotated_with_target, cv2.COLOR_BGR2RGB)
+                        st.image(annotated_rgb, use_container_width=True)
+                        st.caption("Target player highlighted in blue")
+            
+            # Tracking section
+            if st.session_state.target_point:
+                st.divider()
+                st.subheader("📍 Track Target Player")
+                st.write("Track your selected player across all frames.")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    max_distance = st.slider(
+                        "Max Tracking Distance (pixels)",
+                        min_value=10,
+                        max_value=500,
+                        value=100,
+                        help="Maximum pixel distance to match person between frames"
+                    )
+                with col2:
+                    fps = st.number_input(
+                        "FPS (frames per second)",
+                        min_value=1.0,
+                        max_value=120.0,
+                        value=30.0,
+                        step=1.0,
+                        help="Frames per second for time calculation"
+                    )
+                
+                if st.button("▶️ Start Tracking", key="run_tracking_btn"):
+                    with st.spinner("Tracking player across frames..."):
+                        try:
+                            st.session_state.tracking_df = track_target_player(
+                                st.session_state.model,
+                                st.session_state.frames,
+                                st.session_state.target_point,
+                                fps=fps,
+                                confidence=confidence_threshold,
+                                max_distance=max_distance
+                            )
+                            st.success(f"✓ Tracking complete!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error during tracking: {e}")
+            
+            # Display tracking results
+            if st.session_state.tracking_df is not None:
+                st.divider()
+                st.subheader("📊 Tracking Results")
+                
+                tracking_df = st.session_state.tracking_df
+                matched_frames = tracking_df[tracking_df["matched"] == True]
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Frames Tracked", len(matched_frames))
+                with col2:
+                    avg_conf = matched_frames["confidence"].mean() if len(matched_frames) > 0 else 0
+                    st.metric("Avg Confidence", f"{avg_conf:.3f}")
+                with col3:
+                    gaps = len(tracking_df[tracking_df["matched"] == False])
+                    st.metric("Gap Frames", gaps)
+                with col4:
+                    if len(matched_frames) > 1:
+                        x_diff = matched_frames["video_x"].max() - matched_frames["video_x"].min()
+                        y_diff = matched_frames["video_y"].max() - matched_frames["video_y"].min()
+                        range_pixels = max(x_diff, y_diff)
+                        st.metric("Movement Range", f"{range_pixels:.0f}px")
+                
+                st.divider()
+                
+                # Show tracking path visualization
+                st.subheader("📽️ Tracking Path Visualization")
+                st.write("Magenta line shows the tracked player's movement path:")
+                
+                # Get first frame to show path on
+                first_frame = str(st.session_state.frames[0])
+                with st.spinner("Rendering tracking path..."):
+                    try:
+                        path_frame = draw_tracking_path(first_frame, tracking_df, color=(255, 0, 255), thickness=2)
+                        path_rgb = cv2.cvtColor(path_frame, cv2.COLOR_BGR2RGB)
+                        st.image(path_rgb, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not render path: {e}")
+                
+                st.divider()
+                
+                # Show tracking data table
+                st.subheader("📋 Tracking Data (First 20 frames)")
+                display_df = tracking_df.head(20).copy()
+                display_df["video_x"] = display_df["video_x"].round(1)
+                display_df["video_y"] = display_df["video_y"].round(1)
+                display_df["confidence"] = display_df["confidence"].round(4)
+                st.dataframe(display_df, use_container_width=True)
+                
+                # Download tracking data
+                csv_data = tracking_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Tracking Data (CSV)",
+                    data=csv_data,
+                    file_name="tracking_data.csv",
+                    mime="text/csv"
+                )
+                
+                # Next steps for court mapping
+                st.divider()
+                st.info("💡 **Next Steps (Milestone 4):**\n" +
+                       "• Court calibration to map video coordinates to top-down court coordinates\n" +
+                       "• Calculate T-position metrics (recovery time, distance from T, etc.)\n" +
+                       "• Generate movement heatmap")
         
-        # Frame gallery (always show)
+        # Frame gallery (always show at bottom)
         st.divider()
         st.subheader("📽️ Full Frame Gallery")
         st.write(f"All extracted frames ({len(st.session_state.frames)} total):")
