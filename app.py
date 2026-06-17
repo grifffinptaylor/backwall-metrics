@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import cv2
 import pandas as pd
+import numpy as np
 
 from src.video import extract_frames, get_video_metadata
 from src.tracker import (
@@ -12,6 +13,16 @@ from src.tracker import (
     detect_people_in_frames,
     track_target_player,
     draw_tracking_path
+)
+from src.court import (
+    get_default_court_config,
+    get_court_zones,
+    compute_homography,
+    video_to_court_points,
+    assign_zone,
+    draw_court_graphic,
+    draw_path_on_court,
+    calibration_preview
 )
 
 st.set_page_config(page_title="BackWall Metrics", layout="wide")
@@ -36,10 +47,20 @@ if "target_person_idx" not in st.session_state:
     st.session_state.target_person_idx = None
 if "tracking_df" not in st.session_state:
     st.session_state.tracking_df = None
+if "calibration_points_video" not in st.session_state:
+    st.session_state.calibration_points_video = []
+if "calibration_points_court" not in st.session_state:
+    st.session_state.calibration_points_court = []
+if "homography" not in st.session_state:
+    st.session_state.homography = None
+if "calibrated_tracking_df" not in st.session_state:
+    st.session_state.calibrated_tracking_df = None
+if "court_config" not in st.session_state:
+    st.session_state.court_config = get_default_court_config()
 
 # Create tabs
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Upload Video", "Movement Analysis", "Shot Scouting", "Report"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Upload Video", "Movement Analysis", "Court Calibration", "Shot Scouting", "Report"]
 )
 
 # TAB 1: Upload Video
@@ -391,12 +412,230 @@ with tab2:
         if len(st.session_state.frames) > 15:
             st.caption(f"... and {len(st.session_state.frames) - 15} more frames")
 
-# TAB 3: Shot Scouting
+# TAB 3: Court Calibration
 with tab3:
+    st.header("🎾 Court Calibration")
+    
+    if st.session_state.tracking_df is None:
+        st.info("👈 **First, complete player tracking in the 'Movement Analysis' tab**")
+    else:
+        st.success(f"✓ Tracking data available ({len(st.session_state.tracking_df)} frames)")
+        
+        st.divider()
+        st.subheader("📍 Court Calibration Setup")
+        st.write("Click buttons to select 5 key points on the court from a video frame.")
+        st.write("This calibration maps video pixels to court coordinates.")
+        
+        # Display first frame for calibration
+        first_frame_path = st.session_state.frames[0]
+        frame = cv2.imread(str(first_frame_path))
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Show calibration point status
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Points Selected", len(st.session_state.calibration_points_video))
+        with col2:
+            st.metric("Required", 5)
+        with col3:
+            st.metric("Status", "Complete" if len(st.session_state.calibration_points_video) == 5 else "Incomplete")
+        
+        st.divider()
+        st.subheader("Step 1: Select Calibration Points")
+        st.write("Click a button, then the pixel coordinates will be recorded from the frame.")
+        
+        # Calibration point buttons
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("1️⃣ Front-Left Corner", key="cal_front_left"):
+                # In real app, user would click on frame - for now use default
+                st.session_state.calibration_points_video = st.session_state.calibration_points_video[:0]
+                st.session_state.calibration_points_video.append((100, 50))  # Example
+                st.session_state.calibration_points_court = [(0, 0)]
+                st.success("Point 1 recorded (example)")
+                st.rerun()
+        
+        with col2:
+            if st.button("2️⃣ Front-Right Corner", key="cal_front_right"):
+                if len(st.session_state.calibration_points_video) >= 1:
+                    st.session_state.calibration_points_video.append((frame.shape[1] - 100, 50))
+                    st.session_state.calibration_points_court.append((100, 0))
+                    st.success("Point 2 recorded (example)")
+                    st.rerun()
+                else:
+                    st.warning("Select Front-Left first")
+        
+        with col3:
+            if st.button("3️⃣ Back-Left Corner", key="cal_back_left"):
+                if len(st.session_state.calibration_points_video) >= 2:
+                    st.session_state.calibration_points_video.append((100, frame.shape[0] - 50))
+                    st.session_state.calibration_points_court.append((0, 100))
+                    st.success("Point 3 recorded (example)")
+                    st.rerun()
+                else:
+                    st.warning("Select Front corners first")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("4️⃣ Back-Right Corner", key="cal_back_right"):
+                if len(st.session_state.calibration_points_video) >= 3:
+                    st.session_state.calibration_points_video.append((frame.shape[1] - 100, frame.shape[0] - 50))
+                    st.session_state.calibration_points_court.append((100, 100))
+                    st.success("Point 4 recorded (example)")
+                    st.rerun()
+                else:
+                    st.warning("Select Back-Left first")
+        
+        with col2:
+            if st.button("5️⃣ T Position", key="cal_t_position"):
+                if len(st.session_state.calibration_points_video) >= 4:
+                    st.session_state.calibration_points_video.append((frame.shape[1] // 2, int(frame.shape[0] * 0.6)))
+                    st.session_state.calibration_points_court.append((50, 62))
+                    st.success("Point 5 recorded (example)")
+                    st.rerun()
+                else:
+                    st.warning("Select all corners first")
+        
+        with col3:
+            if st.button("🔄 Reset Calibration", key="reset_calibration"):
+                st.session_state.calibration_points_video = []
+                st.session_state.calibration_points_court = []
+                st.session_state.homography = None
+                st.session_state.calibrated_tracking_df = None
+                st.success("Calibration reset")
+                st.rerun()
+        
+        # Show calibration preview
+        if len(st.session_state.calibration_points_video) > 0:
+            st.divider()
+            st.subheader("Calibration Point Preview")
+            
+            preview_img = calibration_preview(
+                frame_rgb,
+                st.session_state.calibration_points_video,
+                st.session_state.court_config
+            )
+            st.image(preview_img, use_container_width=True)
+            st.caption(f"Showing {len(st.session_state.calibration_points_video)} calibration points")
+        
+        # Compute homography and apply
+        if len(st.session_state.calibration_points_video) == 5:
+            st.divider()
+            st.subheader("Step 2: Apply Calibration")
+            
+            if st.button("📐 Compute Calibration", key="compute_calibration"):
+                try:
+                    with st.spinner("Computing homography matrix..."):
+                        st.session_state.homography = compute_homography(
+                            st.session_state.calibration_points_video,
+                            st.session_state.calibration_points_court
+                        )
+                    
+                    with st.spinner("Transforming tracking data to court coordinates..."):
+                        # Transform tracking data
+                        tracking_df = st.session_state.tracking_df.copy()
+                        
+                        # Get matched frames only
+                        matched_mask = tracking_df["matched"] == True
+                        matched_points = tracking_df.loc[matched_mask, ["video_x", "video_y"]].values
+                        
+                        if len(matched_points) > 0:
+                            court_points = video_to_court_points(
+                                matched_points,
+                                st.session_state.homography
+                            )
+                            
+                            # Add court coordinates
+                            tracking_df["court_x"] = np.nan
+                            tracking_df["court_y"] = np.nan
+                            tracking_df.loc[matched_mask, "court_x"] = court_points[:, 0]
+                            tracking_df.loc[matched_mask, "court_y"] = court_points[:, 1]
+                            
+                            # Assign zones
+                            tracking_df["zone"] = tracking_df.apply(
+                                lambda row: assign_zone(row["court_x"], row["court_y"], get_court_zones())
+                                if pd.notna(row["court_x"]) else "unknown",
+                                axis=1
+                            )
+                            
+                            st.session_state.calibrated_tracking_df = tracking_df
+                    
+                    st.success("✓ Calibration applied successfully!")
+                    st.rerun()
+                
+                except Exception as e:
+                    st.error(f"❌ Error during calibration: {e}")
+            
+            if st.session_state.homography is not None:
+                st.divider()
+                st.subheader("✓ Calibration Complete!")
+                st.success("Tracking data has been transformed to court coordinates")
+                
+                # Show results
+                if st.session_state.calibrated_tracking_df is not None:
+                    cal_df = st.session_state.calibrated_tracking_df
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Frames Calibrated", len(cal_df[cal_df["matched"] == True]))
+                    with col2:
+                        st.metric("Gap Frames", len(cal_df[cal_df["matched"] == False]))
+                    with col3:
+                        zones = cal_df["zone"].value_counts()
+                        st.metric("Unique Zones", len(zones))
+                    with col4:
+                        court_range = max(
+                            cal_df["court_x"].max() - cal_df["court_x"].min(),
+                            cal_df["court_y"].max() - cal_df["court_y"].min()
+                        )
+                        st.metric("Court Range", f"{court_range:.1f}")
+                    
+                    st.divider()
+                    st.subheader("📊 Calibrated Tracking Data (First 20 frames)")
+                    display_df = cal_df.head(20).copy()
+                    display_df["video_x"] = display_df["video_x"].round(1)
+                    display_df["video_y"] = display_df["video_y"].round(1)
+                    display_df["court_x"] = display_df["court_x"].round(2)
+                    display_df["court_y"] = display_df["court_y"].round(2)
+                    st.dataframe(display_df, use_container_width=True)
+                    
+                    # Show court visualization
+                    st.divider()
+                    st.subheader("🎾 Movement Path on Court")
+                    
+                    court_img = draw_court_graphic(800, 800, st.session_state.court_config)
+                    
+                    matched_data = cal_df[cal_df["matched"] == True]
+                    if len(matched_data) > 0:
+                        court_path = matched_data[["court_x", "court_y"]].values
+                        court_img = draw_path_on_court(
+                            court_img,
+                            court_path,
+                            st.session_state.court_config,
+                            color=(0, 255, 0),
+                            thickness=2
+                        )
+                    
+                    court_img_rgb = cv2.cvtColor(court_img, cv2.COLOR_BGR2RGB)
+                    st.image(court_img_rgb, use_container_width=True)
+                    st.caption("Player movement path on court (green = tracked, red dot = end, blue dot = start)")
+                    
+                    # Download calibrated data
+                    st.divider()
+                    csv_data = cal_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Calibrated Tracking Data (CSV)",
+                        data=csv_data,
+                        file_name="calibrated_tracking_data.csv",
+                        mime="text/csv"
+                    )
+
+# TAB 4: Shot Scouting
+with tab4:
     st.header("Shot Scouting")
     st.info("Coming in later milestones")
 
-# TAB 4: Report
-with tab4:
+# TAB 5: Report
+with tab5:
     st.header("Report")
     st.info("Coming in later milestones")
